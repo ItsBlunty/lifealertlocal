@@ -31,19 +31,23 @@ signatures differ and will not compile this code. Core >= 3.3.0 is required so
 that the recv (`esp_now_recv_info_t`) and send (`wifi_tx_info_t`) callback
 signatures both match.
 
-### Build
+> **Run PlatformIO from PowerShell (or cmd), NOT Git Bash/MSYS.** The pioarduino
+> platform's `idf_tools.py` aborts with "MSys/Mingw is not supported", which leaves
+> the toolchain half-installed and the build fails to find `xtensa-esp-elf-g++`.
 
-```sh
-PIO="C:/Users/vhdbl/.platformio/penv/Scripts/platformio.exe"
-"$PIO" run -d tx
-"$PIO" run -d rx
+### Build (PowerShell)
+
+```powershell
+$PIO = "C:\Users\vhdbl\.platformio\penv\Scripts\platformio.exe"
+& $PIO run -d tx
+& $PIO run -d rx
 ```
 
-### Flash + serial monitor (per board)
+### Flash + serial monitor (per board, PowerShell)
 
-```sh
-"$PIO" run -d rx -t upload          # upload to the board on the auto-detected port
-"$PIO" device monitor -b 115200     # watch serial; add --port COMx if needed
+```powershell
+& $PIO run -d rx -t upload          # upload to the board on the auto-detected port
+& $PIO device monitor -b 115200     # watch serial; add --port COMx if needed
 ```
 
 ## First-time MAC bootstrap
