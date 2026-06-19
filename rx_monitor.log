@@ -1,7 +1,0 @@
-=== RX capture start 06/19/2026 13:23:52 ===
-   7.0  [rx] heartbeat seq=17 batt=0
-  27.0  [rx] heartbeat seq=18 batt=0
-  27.6  [rx] state -> ALARM
-  27.6  [rx] ALERT seq=19 batt=0 -> alarm LATCHED
-  30.0  [rx] ALERT seq=20 batt=0 -> alarm LATCHED
-=== done ===
