@@ -15,7 +15,7 @@
 #include "common.h"
 
 // ---------------- CONFIG ----------------
-uint8_t TX_MAC[6] = {0, 0, 0, 0, 0, 0};   // <-- FILL IN transmitter MAC (see README)
+uint8_t TX_MAC[6] = {0xEC, 0xE3, 0x34, 0x1A, 0x64, 0xFC};   // transmitter (board #2)
 
 #define BUZZER_GPIO        25         // active buzzer (digitalWrite). Wire later.
 #define ALARM_LED_GPIO     26         // alarm LED. Wire later.

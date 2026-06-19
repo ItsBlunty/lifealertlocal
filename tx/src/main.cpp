@@ -12,7 +12,7 @@
 #include "common.h"
 
 // ---------------- CONFIG ----------------
-uint8_t RX_MAC[6] = {0, 0, 0, 0, 0, 0};   // <-- FILL IN receiver MAC (see README)
+uint8_t RX_MAC[6] = {0x44, 0x1D, 0x64, 0xF5, 0x87, 0xF8};   // receiver (board #1)
 
 #define BUTTON_GPIO         GPIO_NUM_0   // BOOT button (strapping pin; prototype only, see README)
 #define LED_GPIO            2            // onboard LED = confirm / failure feedback
@@ -100,13 +100,16 @@ void setup() {
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
   WiFi.mode(WIFI_STA);
-  Serial.print("TX MAC (put this in TX_MAC[] of rx/src/main.cpp): ");
-  Serial.println(WiFi.macAddress());
 
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) { Serial.println("esp_now_init failed; sleeping"); goToSleep(); }
   esp_now_register_send_cb(onSent);
   esp_now_register_recv_cb(onRecv);
+
+  // Read the MAC only AFTER esp_now_init(); reading right after WiFi.mode()
+  // returns 00:00:00:00:00:00 because the WiFi driver isn't up yet.
+  Serial.print("TX MAC (put this in TX_MAC[] of rx/src/main.cpp): ");
+  Serial.println(WiFi.macAddress());
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, RX_MAC, 6);
