@@ -15,7 +15,7 @@
 #include "common.h"
 
 // ---------------- CONFIG ----------------
-uint8_t TX_MAC[6] = {0xEC, 0xE3, 0x34, 0x1A, 0x64, 0xFC};   // transmitter (board #2)
+uint8_t TX_MAC[6] = {0xE0, 0x72, 0xA1, 0xF9, 0x54, 0x1C};   // transmitter (board #2 = XIAO ESP32-S3)
 
 #define BUZZER_GPIO        25         // active buzzer (digitalWrite). Wire later.
 #define ALARM_LED_GPIO     26         // alarm LED. Wire later.
@@ -50,8 +50,24 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
                   (unsigned long)m.seq, m.battery_mv);
     sendAck(info->src_addr, m.seq);
   } else if (m.type == MSG_HEARTBEAT) {
-    Serial.printf("[rx] heartbeat seq=%lu batt=%u%s\n",
-                  (unsigned long)m.seq, m.battery_mv, batteryLow ? " (LOW)" : "");
+    // Dedup the LOG only: a healthy TX sends each seq once (logged once). A wedged TX
+    // that repeats one seq gets collapsed to a single line plus a suppressed-count
+    // summary, so a flood can't drown the serial log. Liveness + ACK still act on EVERY
+    // frame (above), so nothing functional is dropped. A TX reset (seq -> 1) is a new
+    // seq, so it logs normally rather than being mistaken for a duplicate.
+    static uint32_t lastHbSeq = 0;
+    static bool     haveHb    = false;
+    static uint32_t dupCount  = 0;
+    if (haveHb && m.seq == lastHbSeq) {
+      dupCount++;
+    } else {
+      if (dupCount > 0)
+        Serial.printf("[rx]   (suppressed %lu duplicate heartbeat frames of seq=%lu)\n",
+                      (unsigned long)dupCount, (unsigned long)lastHbSeq);
+      dupCount = 0; lastHbSeq = m.seq; haveHb = true;
+      Serial.printf("[rx] heartbeat seq=%lu batt=%u%s\n",
+                    (unsigned long)m.seq, m.battery_mv, batteryLow ? " (LOW)" : "");
+    }
     sendAck(info->src_addr, m.seq);
   }
 }
@@ -79,6 +95,8 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  { uint8_t pc; wifi_second_chan_t sc; esp_wifi_get_channel(&pc, &sc);
+    Serial.printf("[rx] wifi channel = %u (want %u)\n", pc, ESPNOW_CHANNEL); }
   if (esp_now_init() != ESP_OK) Serial.println("esp_now_init failed");
   esp_now_register_recv_cb(onRecv);
 
