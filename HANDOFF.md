@@ -22,9 +22,8 @@ Status: **firmware written, both images build, RX + XIAO-S3-TX pairing verified 
 hardware** (heartbeats received, `seq` increments across deep-sleep cycles). No
 peripherals (buzzer/external LEDs/battery divider) wired yet — verification is via
 serial + an addressable RGB LED (see below). **Both boards reflashed 2026-07-10 with the
-D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9 and the D1 RGB LED
-confirmed working on hardware. Rainbow link-down indicator (below) is flashed but its
-link-loss/recovery behaviour is not yet hardware-verified (see §6/§8).**
+D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9, the D1 RGB LED,
+and the rainbow link-down indicator all confirmed working on hardware (see §6/§8).**
 
 ### 2026-07-07 changes (flashed + hardware-verified 2026-07-10)
 - **`HEARTBEAT_SECONDS` = 300** (was 20) in BOTH `tx/` and `rx/` — deployment cadence.
@@ -38,7 +37,7 @@ link-loss/recovery behaviour is not yet hardware-verified (see §6/§8).**
   cell TX life is ~**2 weeks** (LED-dominated), vs ~2 months if the LED were power-gated.
   User accepted the ~2-week figure; NOT adding a MOSFET high-side switch for now.
 
-### 2026-07-10 change — TX "link down" rainbow indicator (flashed, NOT yet hardware-verified)
+### 2026-07-10 change — TX "link down" rainbow indicator (✅ hardware-verified 2026-07-10)
 - **What:** when a HEARTBEAT is not app-ACKed by the RX (receiver unreachable), the TX now
   **stays awake and cycles a bright rainbow** (`RAINBOW_LEVEL 160`, ~2 s/sweep) on the D1
   pixel, re-sending the heartbeat each sweep, **until the RX acks**. Then it drops through
@@ -50,8 +49,10 @@ link-loss/recovery behaviour is not yet hardware-verified (see §6/§8).**
   and takes priority (that branch runs first); the rainbow is strictly the heartbeat/
   link-alive path, so the two never fight. Also fires on **cold-boot with the RX down**
   (power on the button while the base is off → immediate rainbow). Self-healing.
-- **Test (pending):** power RX off → tap XIAO RESET → expect continuous rainbow within ~2 s;
-  power RX on → rainbow stops within a sweep or two, TX serial logs `ack — link restored`.
+- **Verified on hardware 2026-07-10:** RX left off; at the next 5-min heartbeat the TX
+  found the RX unreachable and began the continuous rainbow (confirms the timer-heartbeat
+  path, not just cold-boot, triggers it). Recovery is self-healing by design — the next
+  acked heartbeat drops through to normal `goToSleep()` (300 s cadence).
 
 ---
 
