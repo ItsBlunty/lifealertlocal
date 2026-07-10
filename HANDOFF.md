@@ -13,15 +13,45 @@ ESP-NOW link between a button (**TX**, deep-sleeping) and a **latching alarm** a
 
 - **RX** is an ESP32-WROOM dev board (reuses its BOOT button / GPIO0 as the alarm-clear button).
 - **TX** was migrated from an ESP32-WROOM to a **Seeed XIAO ESP32-S3** (2026-07-06).
-  The button is now an **external switch on pad D0 / GPIO1 to GND** (no longer the
-  BOOT strapping pin — see §7). Verified working on WROOM; **XIAO-S3 TX bring-up now
+  The button is now an **external switch on pad D9 / GPIO8 to GND** (moved from D0/GPIO1
+  on 2026-07-07 for easier wiring; still RTC-capable so EXT1 wake is unchanged — no longer
+  the BOOT strapping pin, see §7). Verified working on WROOM; **XIAO-S3 TX bring-up now
   done (2026-07-07): flashed, MAC paired into `rx/`, heartbeat link confirmed live.**
 
 Status: **firmware written, both images build, RX + XIAO-S3-TX pairing verified on
 hardware** (heartbeats received, `seq` increments across deep-sleep cycles). No
 peripherals (buzzer/external LEDs/battery divider) wired yet — verification is via
-serial + the onboard LED. **Not yet re-run on the XIAO: physical button ALERT +
-2-blink/6-blink feedback, and offline-recovery (see §6/§8).**
+serial + an addressable RGB LED (see below). **Both boards reflashed 2026-07-10 with the
+D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9 and the D1 RGB LED
+confirmed working on hardware. Rainbow link-down indicator (below) is flashed but its
+link-loss/recovery behaviour is not yet hardware-verified (see §6/§8).**
+
+### 2026-07-07 changes (flashed + hardware-verified 2026-07-10)
+- **`HEARTBEAT_SECONDS` = 300** (was 20) in BOTH `tx/` and `rx/` — deployment cadence.
+  Consequence: offline detection is now `300*OFFLINE_MULT(3)` = **900 s / 15 min**, not 60 s.
+- **TX button moved D0/GPIO1 → D9/GPIO8** (`BUTTON_GPIO GPIO_NUM_8`), RTC-capable, EXT1 unchanged.
+- **TX feedback LED is now an external addressable WS2812/NeoPixel on D1/GPIO2**, replacing
+  the onboard GPIO21 LED. Driven by the core's built-in `neopixelWrite()` (no lib_deps).
+  **Green** 2-blink = alert delivered/acked; **red** 6-blink = urgent/undelivered. Wire:
+  DATA-IN→D1/GPIO2, VDD→3V3, GND→GND.
+- **Battery note (accepted):** the WS2812 draws ~0.6–1 mA even while dark, so on a 300 mAh
+  cell TX life is ~**2 weeks** (LED-dominated), vs ~2 months if the LED were power-gated.
+  User accepted the ~2-week figure; NOT adding a MOSFET high-side switch for now.
+
+### 2026-07-10 change — TX "link down" rainbow indicator (flashed, NOT yet hardware-verified)
+- **What:** when a HEARTBEAT is not app-ACKed by the RX (receiver unreachable), the TX now
+  **stays awake and cycles a bright rainbow** (`RAINBOW_LEVEL 160`, ~2 s/sweep) on the D1
+  pixel, re-sending the heartbeat each sweep, **until the RX acks**. Then it drops through
+  the normal `goToSleep()` and resumes the standard 300 s cadence — no lingering state
+  (the heartbeat/rainbow path never touches flash; only `seqCounter` advances).
+- **Why:** a dead link should never happen in normal use, so the wearer must notice it
+  immediately. Battery cost of staying awake is accepted by design (user's call).
+- **Scope/priority:** an active ALERT still runs its own never-give-up **red 6-blink** loop
+  and takes priority (that branch runs first); the rainbow is strictly the heartbeat/
+  link-alive path, so the two never fight. Also fires on **cold-boot with the RX down**
+  (power on the button while the base is off → immediate rainbow). Self-healing.
+- **Test (pending):** power RX off → tap XIAO RESET → expect continuous rainbow within ~2 s;
+  power RX on → rainbow stops within a sweep or two, TX serial logs `ack — link restored`.
 
 ---
 
@@ -106,8 +136,8 @@ $env:PYTHONIOENCODING = "utf-8"
 
 - Two projects `tx/` + `rx/`, identical `src/common.h` (protocol `Message` struct,
   `PROTO_VERSION 1`, `ESPNOW_CHANNEL 1`).
-- **`HEARTBEAT_SECONDS = 20` in BOTH** — a TESTING value. **TODO: set to 300 for
-  deployment** (must match in both projects).
+- **`HEARTBEAT_SECONDS = 300` in BOTH** (5 min, deployment value; must match). Was 20
+  during testing. Offline threshold is now ~15 min (see §6/OFFLINE_MULT).
 - **Battery sense is OFF**: `BATTERY_SENSE_ENABLED 0`, `FAKE_BATTERY_MV 0` →
   `battery_mv = 0` = "N/A", so RX never false-warns. To test low-battery, set
   `FAKE_BATTERY_MV 3200` in `tx/src/main.cpp` and reflash.
@@ -129,11 +159,11 @@ $env:PYTHONIOENCODING = "utf-8"
   "can't clear by power-cycle" consequence.
 - **TX wakeup is EXT1 (ANY_LOW), not EXT0.** The ESP32-S3 has no EXT0 peripheral, so
   the XIAO port uses `esp_sleep_enable_ext1_wakeup()` with an RTC pull-up held through
-  sleep; the wake-cause check is `ESP_SLEEP_WAKEUP_EXT1`. Button is D0/GPIO1 to GND.
-  (Battery ADC note: ADC1 on the S3 is GPIO1-10, not the WROOM's GPIO32-39.)
+  sleep; the wake-cause check is `ESP_SLEEP_WAKEUP_EXT1`. Button is D9/GPIO8 to GND
+  (moved from D0/GPIO1 on 2026-07-07). (Battery ADC note: ADC1 on the S3 is GPIO1-10.)
 - **Both boards print their WiFi channel at boot** (`[tx]/[rx] wifi channel = 1`) — a
   leftover diagnostic from the board-swap hunt; handy to confirm both are on ch 1.
-- Offline threshold = `HEARTBEAT_SECONDS * OFFLINE_MULT(3)` = ~60s with current settings.
+- Offline threshold = `HEARTBEAT_SECONDS * OFFLINE_MULT(3)` = ~900s (15 min) with the 300s heartbeat.
 
 ---
 
@@ -210,10 +240,10 @@ Historical (WROOM TX prototype):
 - Because BOOT *was* the trigger, "hold BOOT during reset" was indistinguishable from
   a real press once asleep. You could not cleanly test "reset with trigger held."
 
-**Resolved on the XIAO S3 (2026-07-06):** the trigger is now an external button on
-the dedicated **RTC pad D0/GPIO1** (EXT1 wake), off any strapping pin — so the
-prototype hazard above no longer applies. The XIAO's own BOOT button is only used
-for entering the flash bootloader. (RX clear button can still be any GPIO.)
+**Resolved on the XIAO S3 (2026-07-06):** the trigger is now an external button on a
+dedicated **RTC pad — D9/GPIO8** (EXT1 wake; moved from D0/GPIO1 on 2026-07-07), off any
+strapping pin — so the prototype hazard above no longer applies. The XIAO's own BOOT button
+is only used for entering the flash bootloader. (RX clear button can still be any GPIO.)
 
 ---
 
@@ -224,8 +254,8 @@ for entering the flash bootloader. (RX clear button can still be any GPIO.)
    vibration motor (via transistor); verify the 3 warning states are audibly distinct.
 3. Battery divider on ADC1 (GPIO34): set `BATTERY_SENSE_ENABLED 1`,
    `BATTERY_DIVIDER = (R1+R2)/R2`, calibrate vs multimeter, set `LOW_BATT_MV`.
-4. Raise `HEARTBEAT_SECONDS` to 300 in **both** projects.
-5. Permanent build: ~~dedicated trigger GPIO (off BOOT)~~ **done on XIAO (D0/GPIO1)**;
+4. ~~Raise `HEARTBEAT_SECONDS` to 300 in **both** projects.~~ **DONE 2026-07-07** (offline now ~15 min).
+5. Permanent build: ~~dedicated trigger GPIO (off BOOT)~~ **done on XIAO (D9/GPIO8)**;
    enclosure, RX power backup (mains-only today = alarm dead on power loss), optional
    ESP-NOW encryption.
 6. **XIAO S3 bring-up:** ✅ **DONE 2026-07-07** — TX MAC `E0:72:A1:F9:54:1C` paired into

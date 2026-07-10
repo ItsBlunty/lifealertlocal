@@ -21,7 +21,7 @@ uint8_t TX_MAC[6] = {0xE0, 0x72, 0xA1, 0xF9, 0x54, 0x1C};   // transmitter (boar
 #define ALARM_LED_GPIO     26         // alarm LED. Wire later.
 #define STATUS_LED_GPIO    2          // onboard LED — also the no-buzzer test indicator
 #define CLEAR_BUTTON_GPIO  0          // BOOT button clears the alarm (prototype)
-#define HEARTBEAT_SECONDS  20         // TESTING value. TODO: 300 for deployment. MUST match TX.
+#define HEARTBEAT_SECONDS  300        // deployment value (5 min). MUST match TX. Offline = this * OFFLINE_MULT.
 #define OFFLINE_MULT       3          // offline after this many missed heartbeats
 #define LOW_BATT_MV        3300       // tune to battery chemistry (with margin above cutoff)
 // ----------------------------------------

@@ -24,10 +24,20 @@
 // ---------------- CONFIG ----------------
 uint8_t RX_MAC[6] = {0x44, 0x1D, 0x64, 0xF5, 0x87, 0xF8};   // receiver (board #1)
 
-#define BUTTON_GPIO         GPIO_NUM_1   // XIAO ESP32-S3 pad D0 (RTC-capable; EXT1 wake). External button to GND.
-#define LED_GPIO            21           // XIAO ESP32-S3 onboard user LED (ACTIVE-LOW) = confirm / failure feedback
-#define LED_ACTIVE_LOW      1            // onboard LED sinks current: LOW = on
-#define HEARTBEAT_SECONDS   20           // TESTING value. TODO: 300 (5 min) for deployment. MUST match RX.
+#define BUTTON_GPIO         GPIO_NUM_8   // XIAO ESP32-S3 pad D9 (RTC-capable; EXT1 wake). External button to GND.
+// Addressable RGB LED (WS2812/NeoPixel-compatible) on XIAO pad D1 = GPIO2 — replaces the
+// onboard LED for all confirm/failure feedback (green = delivered, red = urgent/undelivered).
+// Driven by the Arduino-ESP32 core's built-in RMT helper neopixelWrite(), so NO external
+// library / lib_deps entry is needed. DATA-IN -> GPIO2; VDD -> 3V3 (or 5V), GND -> GND.
+// BATTERY WARNING: a WS2812 draws ~0.6-1 mA even while showing black, which DWARFS the ESP32
+// deep-sleep current (~0.05 mA). Left always-powered it dominates drain (~2 wk on a 300 mAh
+// cell). For battery use, gate the pixel's VDD with a high-side P-MOSFET off a spare GPIO so
+// it's fully unpowered during deep sleep (see HANDOFF roadmap).
+#define RGBLED_GPIO         2            // XIAO pad D1 — WS2812 DATA-IN
+#define RGB_LEVEL           60           // per-channel brightness (0-255); modest to limit current
+#define RAINBOW_LEVEL       160          // brighter — the "link down" rainbow MUST be impossible to miss
+#define RAINBOW_SWEEP_MS    2000         // one full hue rotation ~2s; loops until a heartbeat is acked
+#define HEARTBEAT_SECONDS   300          // deployment value (5 min). MUST match RX.
 #define ACK_TIMEOUT_MS      400          // wait for app-level ACK per attempt
 #define MAX_SEND_ATTEMPTS   20           // persistence for an alert
 #define DEVICE_ID           1
@@ -101,20 +111,47 @@ uint16_t readBatteryMv() {
 #endif
 }
 
-// Onboard LED is active-low on the XIAO S3; wrap it so the logic reads "on/off".
-void ledSet(bool on) {
-#if LED_ACTIVE_LOW
-  digitalWrite(LED_GPIO, on ? LOW : HIGH);
-#else
-  digitalWrite(LED_GPIO, on ? HIGH : LOW);
-#endif
+// Addressable-LED helpers. neopixelWrite(pin, R, G, B) is provided by the core
+// (esp32-hal-rgb-led) and drives one WS2812 pixel via RMT; it configures the pin itself,
+// so no pinMode() is needed.
+void ledOff() { neopixelWrite(RGBLED_GPIO, 0, 0, 0); }
+void ledColor(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(RGBLED_GPIO, r, g, b); }
+
+// Blink the pixel `times` in the given color (leaves it off afterward).
+void blinkColor(int times, int onMs, int offMs, uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < times; i++) {
+    ledColor(r, g, b); delay(onMs);
+    ledOff();          delay(offMs);
+  }
 }
 
-void blink(int times, int onMs, int offMs) {
-  for (int i = 0; i < times; i++) {
-    ledSet(true);  delay(onMs);
-    ledSet(false); delay(offMs);
+// Minimal HSV->RGB (full saturation). h in degrees [0,360); v is the brightness cap.
+void hsvToRgb(uint16_t h, uint8_t v, uint8_t &r, uint8_t &g, uint8_t &b) {
+  uint8_t region = (h / 60) % 6;
+  uint8_t rem    = (h % 60) * 255 / 60;              // 0..255 position within the region
+  uint8_t up     = (uint16_t)v * rem / 255;          // ramp 0 -> v
+  uint8_t down   = v - up;                            // ramp v -> 0
+  switch (region) {
+    case 0: r = v;    g = up;   b = 0;    break;
+    case 1: r = down; g = v;    b = 0;    break;
+    case 2: r = 0;    g = v;    b = up;   break;
+    case 3: r = 0;    g = down; b = v;    break;
+    case 4: r = up;   g = 0;    b = v;    break;
+    default:r = v;    g = 0;    b = down; break;
   }
+}
+
+// One smooth rainbow sweep across the single WS2812 (hue 0->360). Blocks ~RAINBOW_SWEEP_MS,
+// leaves the pixel off. Used as the "RX not reachable" alarm on the TX itself.
+void rainbowSweep() {
+  const int steps = 120;
+  for (int i = 0; i < steps; i++) {
+    uint8_t r, g, b;
+    hsvToRgb((uint16_t)(i * 360 / steps), RAINBOW_LEVEL, r, g, b);
+    ledColor(r, g, b);
+    delay(RAINBOW_SWEEP_MS / steps);
+  }
+  ledOff();
 }
 
 // Returns true only after the RECEIVER app-level ACK is received (requirement #1).
@@ -179,7 +216,7 @@ void goToSleep() {
 void setup() {
   Serial.begin(115200);
   delay(50);
-  pinMode(LED_GPIO, OUTPUT); ledSet(false);
+  ledOff();
 
   // Re-init the (non-critical) heartbeat counter only on a true power-on, when RTC RAM is
   // garbage. The alert flag is NOT here -- it lives in flash and is loaded next.
@@ -248,12 +285,12 @@ void setup() {
     while (!sendMessage(msg)) {       // sendMessage = one burst of retries; loop = forever
       round++;
       Serial.printf("[tx] ALERT not yet acked (round %lu) — retrying\n", (unsigned long)round);
-      blink(6, 300, 150);            // urgent: NOT confirmed yet -> seek help another way
+      blinkColor(6, 300, 150, RGB_LEVEL, 0, 0);   // urgent RED: NOT confirmed yet -> seek help another way
     }
     alertPending = false;            // RX confirmed the latch -> the alert is delivered
     saveAlertState();                // clear the persisted flag so we don't resume after reboot
     Serial.println("[tx] ALERT CONFIRMED (ack received)");
-    blink(2, 60, 80);                // confirmed: two quick blinks
+    blinkColor(2, 60, 80, 0, RGB_LEVEL, 0);     // confirmed: two quick GREEN blinks
 
     // Wait for a clean, debounced RELEASE so bounce can't immediately re-arm EXT1.
     // If it never releases, goToSleep() sleeps on the timer only (won't arm a held pad).
@@ -266,6 +303,23 @@ void setup() {
                   (unsigned long)msg.seq, msg.battery_mv, (int)cause);
     bool ok = sendMessage(msg);
     Serial.println(ok ? "ack" : "no ack");
+
+    // LINK-DOWN ALARM: a heartbeat that the RX doesn't app-ACK means the receiver is
+    // unreachable — a condition that should never happen in normal use, so the wearer must
+    // notice it immediately. Stay awake and cycle a bright rainbow, re-sending the heartbeat
+    // each round, until the RX acks. Battery cost is accepted by design (see HANDOFF §alert).
+    // An active ALERT is handled in the branch above and takes priority, so this only runs
+    // for plain heartbeats. Self-healing: the moment the RX returns, the next send acks and
+    // we drop through to normal sleep.
+    uint32_t downRound = 0;
+    while (!ok) {
+      rainbowSweep();
+      msg.seq = ++seqCounter;
+      Serial.printf("[tx] heartbeat NOT acked — RX unreachable (round %lu), rainbow + retry seq=%lu ... ",
+                    (unsigned long)++downRound, (unsigned long)msg.seq);
+      ok = sendMessage(msg);
+      Serial.println(ok ? "ack — link restored" : "no ack");
+    }
   }
 
   goToSleep();
