@@ -25,6 +25,38 @@ serial + an addressable RGB LED (see below). **Both boards reflashed 2026-07-10 
 D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9, the D1 RGB LED,
 and the rainbow link-down indicator all confirmed working on hardware (see §6/§8).**
 
+### 2026-07-12 changes (RX board swap + battery divider + physical button) — ✅ all verified on hardware
+- **RX board swapped:** the `44:1D:64:F5:87:F8` WROOM is retired as RX; the former spare/old-TX
+  WROOM **`EC:E3:34:1A:64:FC`** is now the RX (flashed `rx/`, COM3, MAC confirmed via esptool at
+  flash time). `tx/`'s `RX_MAC[]` was retargeted `44:1D`→`EC:E3`. `rx/`'s `TX_MAC[]` (the XIAO)
+  is unchanged, so `rx/` source needed no edit. **Old labels now inverted — re-label the boards:**
+  `EC:E3` = RX, `44:1D` = spare.
+- **Battery divider ENABLED + CALIBRATED:** `BATTERY_SENSE_ENABLED 1` in `tx/`. Reads a divider on
+  **D2/GPIO3** (`BATTERY_ADC_PIN 3`). `BATTERY_DIVIDER` calibrated to **2.0306** (from 2.0) via a
+  single-point trim: meter 3.85 V vs reported 3792 mV → `2.0 × 3850/3792`. Recommend 100k/100k legs
+  + 0.1µF ceramic on the ADC node. TX reflashed on COM12 (MAC `e0:72:a1:f9:54:1c` confirmed).
+- **✅ E2E link + battery verified 2026-07-12:** both boards flashed; XIAO RESET → RX logged
+  `heartbeat seq=1 batt=…`, and the TX slept (got the ACK) rather than rainbowing — so the new
+  `EC:E3` pairing works both directions. Post-calibration reading **`batt=3836` vs 3.85 V meter =
+  0.36 % error** — dialed in. Divider is wired, reading, and above the 3300 threshold (no false low-batt).
+- **Note — RX heartbeat-log dedup can hide repeated reads:** every XIAO RESET wipes RTC → each
+  cold-boot heartbeat is `seq=1`, and the RX (§6) suppresses repeated same-`seq` frames, so only the
+  FIRST `seq=1` after an RX boot prints. To re-observe a fresh `batt=`, reset the RX first (pulse
+  EN via RTS, HANDOFF §4) to clear its dedup state, then tap the TX. Liveness/ACK still act on every frame.
+- **Remaining battery item:** `LOW_BATT_MV` (rx/) is still the default **3300** — tune to the cell's
+  cutoff if desired (low-battery path #5 still not exercised on hardware; set `FAKE_BATTERY_MV 3200`
+  in tx/ to test, or just let a real cell sag).
+- **✅ Physical button (D9/GPIO8 → GND) wired + working.** A real momentary button now drives the
+  ALERT (previous verification used a jumper short). **Root cause of a long "button doesn't trigger"
+  hunt: the D9 SIGNAL wire was not solidly connected** (loose/intermittent) — the ground leg was fine.
+  Diagnostic tell that misled us: an intermittent D9 contact would still trip the EXT1 **wake**
+  (a momentary dip is enough) but couldn't hold a stable LOW, so the debounce (`waitButtonStable`,
+  40 ms stable-LOW within `PRESS_CONFIRM_MS`) rejected it as a glitch → the press came through as a
+  **HEARTBEAT, not an ALERT** (no LED, no RX alarm). **Debug lesson for next time: symptom "press
+  wakes the TX (seq increments) but never latches an ALERT" = a marginal button/contact on the SIGNAL
+  side, not the code.** The definitive test is metering **D9→GND while held** (must read ~0 V, not a
+  mid-rail divider voltage); a `seq` bump on the RX alone is ambiguous (EXT1-reject vs a power blip).
+
 ### 2026-07-07 changes (flashed + hardware-verified 2026-07-10)
 - **`HEARTBEAT_SECONDS` = 300** (was 20) in BOTH `tx/` and `rx/` — deployment cadence.
   Consequence: offline detection is now `300*OFFLINE_MULT(3)` = **900 s / 15 min**, not 60 s.
@@ -60,8 +92,8 @@ and the rainbow link-down indicator all confirmed working on hardware (see §6/�
 
 | Role | Board | STA/base MAC | Current COM port | Notes |
 |------|-------|--------------|------------------|-------|
-| **RX** (receiver/alarm) | ESP32-WROOM #1 | `44:1D:64:F5:87:F8` | COM3 | flashed `rx/` |
-| **TX** (button/transmitter) | XIAO ESP32-S3 | `E0:72:A1:F9:54:1C` | (vanishes on sleep; COM12 when awake) | flashed `tx/`; paired into `rx/`'s `TX_MAC[]` 2026-07-07. `EC:E3:34:1A:64:FC` was the OLD WROOM TX |
+| **RX** (receiver/alarm) | ESP32-WROOM ("spare") | `EC:E3:34:1A:64:FC` | COM3 | flashed `rx/`. **Promoted to RX 2026-07-12** (was the old WROOM TX / spare). `TX_MAC[]` unchanged (points at XIAO). |
+| **TX** (button/transmitter) | XIAO ESP32-S3 | `E0:72:A1:F9:54:1C` | (vanishes on sleep; COM12 when awake) | flashed `tx/`; paired into `rx/`'s `TX_MAC[]` 2026-07-07. `tx/` `RX_MAC[]` retargeted `44:1D`→`EC:E3` on 2026-07-12. |
 
 - **RX** is ESP32-WROOM with **Silicon Labs CP210x (CP2102)** USB-UART (VID:PID
   10C4:EA60); blue LED on GPIO2 (solid when latched, periodic blink when idle).

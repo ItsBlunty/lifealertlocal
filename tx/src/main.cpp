@@ -22,7 +22,7 @@
 #include "common.h"
 
 // ---------------- CONFIG ----------------
-uint8_t RX_MAC[6] = {0x44, 0x1D, 0x64, 0xF5, 0x87, 0xF8};   // receiver (board #1)
+uint8_t RX_MAC[6] = {0xEC, 0xE3, 0x34, 0x1A, 0x64, 0xFC};   // receiver = WROOM "spare" EC:E3, promoted to RX 2026-07-12 (was 44:1D:64:F5:87:F8)
 
 #define BUTTON_GPIO         GPIO_NUM_8   // XIAO ESP32-S3 pad D9 (RTC-capable; EXT1 wake). External button to GND.
 // Addressable RGB LED (WS2812/NeoPixel-compatible) on XIAO pad D1 = GPIO2 — replaces the
@@ -53,10 +53,10 @@ uint8_t RX_MAC[6] = {0x44, 0x1D, 0x64, 0xF5, 0x87, 0xF8};   // receiver (board #
 //        FAKE_BATTERY_MV 3200 -> exercise the RX low-battery path end-to-end (it's < LOW_BATT_MV).
 //   BATTERY_SENSE_ENABLED 1 -> read the real divider on BATTERY_ADC_PIN (ADC1 on S3 = GPIO1-10; the XIAO
 //        has no built-in battery divider, so wire your own to a free pad, e.g. D2/GPIO3).
-#define BATTERY_SENSE_ENABLED  0
+#define BATTERY_SENSE_ENABLED  1
 #define FAKE_BATTERY_MV        0
 #define BATTERY_ADC_PIN        3
-#define BATTERY_DIVIDER        2.0f      // (R1+R2)/R2 — match your divider, then calibrate vs a multimeter
+#define BATTERY_DIVIDER        2.0306f   // calibrated 2026-07-12: meter 3.85V vs reported 3792mV (2.0*3850/3792)
 // ----------------------------------------
 
 // Heartbeat sequence lives in RTC NOINIT (survives deep sleep + brownout; the magic guard
