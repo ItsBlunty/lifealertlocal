@@ -30,9 +30,15 @@ volatile bool     alarmLatched   = false;
 volatile uint32_t lastHeartbeatMs = 0;
 volatile uint16_t lastBatteryMv  = 0;
 volatile bool     batteryLow     = false;
+// The TX resends a FIXED seq for the whole life of one alert and stays awake until we tell
+// it (via the ACK flag) that the alarm is no longer active. currentAlarmSeq = the seq that
+// is currently latched; clearedSeq = an alert seq an operator has cleared, which we must NOT
+// re-latch when the still-awake TX resends it (a genuinely new press carries a new seq).
+volatile uint32_t currentAlarmSeq = 0;
+volatile uint32_t clearedSeq      = 0;
 
-void sendAck(const uint8_t *dst, uint32_t seq) {
-  Message a = {}; a.version = PROTO_VERSION; a.type = MSG_ACK; a.seq = seq;
+void sendAck(const uint8_t *dst, uint32_t seq, uint8_t flags = 0) {
+  Message a = {}; a.version = PROTO_VERSION; a.type = MSG_ACK; a.seq = seq; a.flags = flags;
   esp_now_send(dst, (const uint8_t *)&a, sizeof(a));
 }
 
@@ -45,10 +51,18 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (m.battery_mv) { lastBatteryMv = m.battery_mv; batteryLow = (m.battery_mv < LOW_BATT_MV); }
 
   if (m.type == MSG_ALERT) {
-    alarmLatched = true;
-    Serial.printf("[rx] ALERT seq=%lu batt=%u -> alarm LATCHED\n",
-                  (unsigned long)m.seq, m.battery_mv);
-    sendAck(info->src_addr, m.seq);
+    // The TX stays awake and resends this same seq until our ACK says the alarm is no
+    // longer active. If an operator has already cleared THIS seq, don't re-latch it — just
+    // ACK it as cleared so the TX can stop and drop back to its low-power heartbeat cycle.
+    bool active = (m.seq != clearedSeq);
+    if (active) {
+      if (!alarmLatched || m.seq != currentAlarmSeq)   // log once per new alert, not every resend
+        Serial.printf("[rx] ALERT seq=%lu batt=%u -> alarm LATCHED\n",
+                      (unsigned long)m.seq, m.battery_mv);
+      alarmLatched    = true;
+      currentAlarmSeq = m.seq;
+    }
+    sendAck(info->src_addr, m.seq, active ? ACK_ALARM_ACTIVE : 0);
   } else if (m.type == MSG_HEARTBEAT) {
     // Dedup the LOG only: a healthy TX sends each seq once (logged once). A wedged TX
     // that repeats one seq gets collapsed to a single line plus a suppressed-count
@@ -118,7 +132,12 @@ void loop() {
   static uint32_t lastPress = 0;
   if (digitalRead(CLEAR_BUTTON_GPIO) == LOW && now - lastPress > 300) {
     lastPress = now;
-    if (alarmLatched) { alarmLatched = false; Serial.println("[rx] alarm CLEARED by button"); }
+    if (alarmLatched) {
+      alarmLatched = false;
+      clearedSeq   = currentAlarmSeq;   // remember it so the still-awake TX's resends of this
+                                        // same seq are ACKed as cleared instead of re-latching
+      Serial.println("[rx] alarm CLEARED by button (TX will get the cleared ACK and stand down)");
+    }
   }
 
   bool offline = (now - lastHeartbeatMs) >

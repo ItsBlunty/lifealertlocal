@@ -1,6 +1,6 @@
 # Local Life-Alert — Project Handoff / Status
 
-Context-reset summary as of **2026-07-07**. Read this first, then `README.md`
+Context-reset summary as of **2026-07-22**. Read this first, then `README.md`
 (build/flash/test mechanics) and `life-alert-firmware-guide.md` (original design).
 This file captures everything not obvious from the code.
 
@@ -24,6 +24,85 @@ peripherals (buzzer/external LEDs/battery divider) wired yet — verification is
 serial + an addressable RGB LED (see below). **Both boards reflashed 2026-07-10 with the
 D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9, the D1 RGB LED,
 and the rainbow link-down indicator all confirmed working on hardware (see §6/§8).**
+
+### 2026-07-17 changes (LED→two states + "clear-to-stand-down" protocol + link-down dropped-press FIX) — ✅ TX reflashed 2026-07-22; **link-down dropped-press FIX + 10 ms debounce VERIFIED ON HARDWARE**
+- **TX LED reduced to TWO states + off** (was green-2-blink / red-6-blink / rainbow):
+  - **GREEN repeated blink = "someone is coming"** (alert received & the RX alarm is latched/active).
+  - **RED repeated blink = "something is wrong"** (RX unreachable: alert unacked OR heartbeat link-down).
+  - Wearer only has to learn the color, not the pattern. Shared cadence `BLINK_ON_MS/OFF_MS=250`,
+    `BLINK_BURST=6` per round. **The link-down RAINBOW is REMOVED** (rainbowSweep/hsvToRgb/
+    `RAINBOW_LEVEL`/`RAINBOW_SWEEP_MS` deleted) — link-down is now just the red blink. Supersedes the
+    2026-07-10 rainbow entry below.
+- **NEW alert protocol — TX stays awake & GREEN until a human CLEARS at the RX, then a 50-blink escort:**
+  - While an alert is active the TX **never sleeps**. It re-sends the (fixed-seq) ALERT in a loop and,
+    per round: acked+active → **green** burst; unacked → **red** burst; acked+**cleared** → stop.
+  - When the RX operator presses **clear**, the RX records that seq (`clearedSeq`) and thereafter **ACKs
+    that seq as cleared instead of re-latching** (the still-awake TX keeps resending the same seq — a
+    genuinely new press carries a new seq and latches fresh). This is how the TX learns to stand down.
+  - On learning of the clear, the TX does **`GREEN_ESCORT_BLINKS=50`** green blinks (~25 s of reassurance
+    for the responder's walk over), then drops to the normal 300 s deep-sleep heartbeat cycle.
+  - **Why:** lets the responder stop the TX draining its battery (it was awake for the whole alert) while
+    the wearer still sees green = help is still coming. Replaces the old "ack once → 2-blink → sleep".
+- **Protocol/struct:** `common.h` (identical both sides) — the spare `_pad` byte is now `flags`; a
+  `MSG_ACK` carries **`ACK_ALARM_ACTIVE`** so the RX reports alarm state back to the TX. `PROTO_VERSION`
+  unchanged (layout size identical). RX: `sendAck()` gained a `flags` arg; new `currentAlarmSeq`/
+  `clearedSeq`; ALERT log now dedups per new seq (the awake TX re-sends every round).
+- **Reset-safety preserved (req #6):** the flash (NVS) alert flag now clears **only on an operator
+  clear**, never on a bare reset; a reset mid-alert resumes green-blinking. Alert seqs start at 1 so
+  `clearedSeq=0` at boot can't false-match.
+
+- **Debounce tuned to bias HARD toward catching a press (life-alert must not drop one):**
+  `DEBOUNCE_MS 40 → 10` (min continuous-LOW to accept a press; ~5 poll cycles at the 2 ms read
+  interval), `PRESS_CONFIRM_MS 120 → 300` (the WINDOW to *find* that stable-LOW after an EXT1 wake — a
+  timeout, NOT a hold time; wider = catches a bouncy/late-settling contact, early-exits on a real press
+  so nearly free). Two different knobs: DEBOUNCE_MS = "how brief a LOW counts" (lower to catch quicker
+  presses); PRESS_CONFIRM_MS = "how long we keep looking" (raise to catch late/bouncy ones). Noise
+  rejection is now intentionally minimal — **raise DEBOUNCE_MS if real-world noise causes false alerts.**
+
+- **🐛 FIXED IN CODE (built, NOT yet flashed/tested) — dropped press during heartbeat link-down:**
+  The old `while(!ok)` heartbeat link-down loop spun awake doing `blinkRed()`/`sendMessage()` and
+  **never read the button** — EXT1 is a *deep-sleep* wake source and can't fire while awake, and nothing
+  polled the pad. So a real press while the TX showed link-down RED was silently discarded; when the RX
+  returned, the pending heartbeat just acked and the TX slept (no alarm). **User reproduced this on
+  hardware** (firm/repeated presses ignored; confirmed the button itself works fine). The seq jump
+  2→9 in the RX log was the tell: the link-down loop does `++seqCounter` each round, so ~6 heartbeat
+  rounds elapsed while "red" — proof those presses went out as heartbeats, not alerts.
+  **Fix:** new `blinkRedWatchButton()` blinks a red round while **continuously polling** the pad and
+  returns the instant it sees a debounced LOW; new `latchAlert()` helper; `setup()` refactored into ONE
+  unified awake loop so a polled press in the link-down branch calls `latchAlert()` → next iteration
+  flips to the ALERT path → a **real, flash-persisted alert** that delivers + latches the moment the RX
+  returns. Self-healing + reset-persistence unchanged. **TX build is clean.**
+  **✅ VERIFIED ON HARDWARE 2026-07-22:** TX reflashed on COM12; ran the exact broken case — unplug RX →
+  tap TX RESET (immediate link-down RED) → **press the alert button during RED** → replug RX. Result:
+  **RX LED went SOLID (latched) and TX flipped RED→GREEN** — the press is now caught during link-down,
+  not dropped. (Serial monitor was silent through the replug — the one-shot `ALERT … LATCHED` line raced
+  ahead of the monitor open + resend dedup; the LEDs are the ground truth. See the LED-testing note.)
+
+- **✅ E2E VERIFIED on hardware 2026-07-17 (with the two-state + clear protocol; PRE the link-down fix):**
+  - Link up → TX dark (no false red). Press → TX repeated **GREEN**, RX logged `ALERT seq=2 … LATCHED`
+    (logged once despite the awake TX re-sending — the per-seq dedup works), `batt≈4050`.
+  - RX **clear** (BOOT) → RX `alarm CLEARED … TX will stand down` → **stayed IDLE, did NOT re-latch**
+    the resends; TX did its GREEN escort → dark. ✅ clear-to-stand-down works.
+  - **RED during an ACTIVE alert:** with a real latched alert, unplug RX → TX **held RED** (persisted,
+    retrying); replug → TX **RED→GREEN** self-healed and RX re-latched the same `seq=9`. ✅
+  - **✅ NOW VERIFIED (2026-07-22):** the link-down **dropped-press FIX** and the new **10 ms debounce** —
+    TX reflashed, broken case reproduced-then-passed (RX LED SOLID + TX RED→GREEN). See the ✅ line above.
+
+- **⏭️ NEXT SESSION:**
+  1. **Housekeeping — stand the TX down:** after the 2026-07-22 retest the boards were left with a real
+     latched alert (RX solid / TX green, seq=1). **Press CLEAR (BOOT) at the RX** so the TX does its green
+     escort and drops back to the 300 s deep-sleep heartbeat (else it stays awake draining battery).
+  2. Remaining acceptance items are the non-safety ones: **#5 low-battery** (`FAKE_BATTERY_MV 3200` in
+     `tx/`, or tune `LOW_BATT_MV` to the cell), **buzzer/peripheral wiring**, and the **range test**.
+  3. Retire the boot-time `wifi channel` diagnostic prints once confident (roadmap §8).
+  - **Testing note:** design retests so pass/fail is visible on the **LEDs** (RX solid / TX green|red),
+    not just serial — serial is timing-fragile (dedup + replug race). Monitor script this session:
+    `scratchpad\rx_monitor.ps1 -Seconds N` (passive; dies on RX unplug, restart after replug).
+
+- **Note — regression by design:** link-down RED and undelivered-alert RED are now identical (user's
+  intent: "red = something wrong"). So a marginal press that falls through to a heartbeat is no longer
+  visually distinct from a link blip. User is **handling the button/contact in hardware**; firmware side
+  is the 10 ms debounce + the link-down press-poll fix above.
 
 ### 2026-07-12 changes (RX board swap + battery divider + physical button) — ✅ all verified on hardware
 - **RX board swapped:** the `44:1D:64:F5:87:F8` WROOM is retired as RX; the former spare/old-TX
@@ -69,7 +148,7 @@ and the rainbow link-down indicator all confirmed working on hardware (see §6/�
   cell TX life is ~**2 weeks** (LED-dominated), vs ~2 months if the LED were power-gated.
   User accepted the ~2-week figure; NOT adding a MOSFET high-side switch for now.
 
-### 2026-07-10 change — TX "link down" rainbow indicator (✅ hardware-verified 2026-07-10)
+### 2026-07-10 change — TX "link down" rainbow indicator (⚠️ SUPERSEDED 2026-07-17 — rainbow removed, link-down is now the RED blink; see the 2026-07-17 entry above)
 - **What:** when a HEARTBEAT is not app-ACKed by the RX (receiver unreachable), the TX now
   **stays awake and cycles a bright rainbow** (`RAINBOW_LEVEL 160`, ~2 s/sweep) on the D1
   pixel, re-sending the heartbeat each sweep, **until the RX acks**. Then it drops through
@@ -250,9 +329,11 @@ $env:PYTHONIOENCODING = "utf-8"
   6-blinking (flash survived) → plug RX in → delivered `ALERT seq=2 → LATCHED` + 2-blink,
   flag cleared, back to heartbeats. (Tell-tale: delivered alert `seq=2` from flash, next
   heartbeat `seq=1` from wiped RTC.)
-- **Behavioural consequence (intended):** a genuinely-triggered-but-undelivered alert
-  **cannot be cleared by power-cycling the TX** — only by delivery to the RX (then a human
-  clears at the RX) or a reflash.
+- **Behavioural consequence (intended):** a genuinely-triggered alert **cannot be cleared by
+  power-cycling the TX** — only by a human pressing **clear at the RX** (which the RX signals
+  back to the TX via the cleared ACK, 2026-07-17) or a reflash. (Pre-2026-07-17 the flag
+  cleared on first delivery/ack; now it clears on the operator's clear — the TX stays awake
+  and GREEN in between.)
 
 ### Still pending
 - **#5 Low-battery warning** — NOT tested on hardware. Set `FAKE_BATTERY_MV 3200`

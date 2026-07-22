@@ -8,8 +8,10 @@
 // alert flag is only ever set by a debounced EXT1 button press, so a spurious reset alone
 // never creates one. But once a real press sets it, the flag is stored in FLASH (NVS) and
 // the alert is re-sent after ANY reset -- brownout, watchdog, the EN/RESET button, even a
-// full power-off / dead battery -- until the RX confirms the latch. A genuinely triggered
-// alert is therefore never lost; it clears only on delivery (or a reflash).
+// full power-off / dead battery. While the alert is active the TX stays awake and blinks
+// GREEN (RX reachable/latched) or RED (RX unreachable); it only stands down once a human
+// operator CLEARS the alarm at the RX (signalled back in the ACK). A genuinely triggered
+// alert is therefore never lost; it clears only on an operator clear (or a reflash).
 // NOTE: the S3 has no EXT0 peripheral (unlike the classic ESP32-WROOM), so the
 // button wake uses EXT1 (ANY_LOW) instead of ext0.
 
@@ -35,16 +37,30 @@ uint8_t RX_MAC[6] = {0xEC, 0xE3, 0x34, 0x1A, 0x64, 0xFC};   // receiver = WROOM 
 // it's fully unpowered during deep sleep (see HANDOFF roadmap).
 #define RGBLED_GPIO         2            // XIAO pad D1 — WS2812 DATA-IN
 #define RGB_LEVEL           60           // per-channel brightness (0-255); modest to limit current
-#define RAINBOW_LEVEL       160          // brighter — the "link down" rainbow MUST be impossible to miss
-#define RAINBOW_SWEEP_MS    2000         // one full hue rotation ~2s; loops until a heartbeat is acked
+// Two-state feedback (plus off). GREEN repeated blink = alert delivered & acked ("someone is
+// coming"); RED repeated blink = something is wrong (alert not acked, OR link down). Same
+// cadence for both so the wearer only has to learn the color, not the pattern.
+#define BLINK_ON_MS         250          // blink on-time
+#define BLINK_OFF_MS        250          // blink off-time
+#define BLINK_BURST         6            // blinks per round while alerting (green=coming / red=wrong)
+#define GREEN_ESCORT_BLINKS 50           // after the RX operator clears: reassurance blinks for the responder's trip
 #define HEARTBEAT_SECONDS   300          // deployment value (5 min). MUST match RX.
 #define ACK_TIMEOUT_MS      400          // wait for app-level ACK per attempt
 #define MAX_SEND_ATTEMPTS   20           // persistence for an alert
 #define DEVICE_ID           1
 
 // Button debounce / anti-wedge (see the "stuck-awake heartbeat flood" note in HANDOFF).
-#define DEBOUNCE_MS         40           // pad level must hold this long to be accepted
-#define PRESS_CONFIRM_MS    120          // window to confirm a debounced press after an EXT1 wake
+// Biased HARD toward CATCHING a real press (a life-alert must not drop one): DEBOUNCE_MS is
+// the minimum continuous-LOW time that counts as a press — lowered 40->10 (~5 poll cycles at
+// the 2 ms read interval) so even a quick/marginal press latches. It still rejects a single
+// stray sample, but noise rejection is intentionally minimal; RAISE it if real-world noise
+// causes false alerts. PRESS_CONFIRM_MS is the WINDOW we keep looking for that stable-LOW
+// after an EXT1 wake (a timeout, NOT a hold time); widened 120->300 so a bouncy contact that
+// settles late still confirms. It early-exits the moment a real press is seen, so the wider
+// window only costs a little extra awake time on a false EXT1 glitch. See HANDOFF
+// §2026-07-12 (marginal D9 press -> heartbeat).
+#define DEBOUNCE_MS         10           // min continuous-LOW to accept as a press (was 40; lower=catch more, less noise reject)
+#define PRESS_CONFIRM_MS    300          // window to find a debounced press after an EXT1 wake (was 120)
 #define RELEASE_WAIT_MS     6000         // max wait for a debounced release before sleeping (timer-only)
 
 // Battery sense is OFF until a divider is wired (guide §3).
@@ -86,7 +102,17 @@ void saveAlertState() {
   prefs.end();
 }
 
+// Latch a NEW alert: set the pending flag + a fresh FIXED seq and PERSIST to flash NOW,
+// before any send, so even a brownout/power-loss during the first transmit can't lose it.
+// Called both on a debounced wake-press and when a press is POLLED during a link-down loop.
+void latchAlert() {
+  alertPending = true;
+  alertSeq     = ++seqCounter;               // one seq for this alert; reused across retries/resets
+  saveAlertState();
+}
+
 volatile bool macCbFired = false, macDelivered = false, appAcked = false;
+volatile bool ackAlarmActive = false;   // last ACK's alarm state: true = RX still latched, false = operator cleared
 
 // core >= 3.3.0 send-callback signature (wifi_tx_info_t).
 // On core 3.0-3.2 this would be (const uint8_t *mac, ...); on 2.x likewise.
@@ -98,7 +124,10 @@ void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < (int)sizeof(Message)) return;
   Message m; memcpy(&m, data, sizeof(m));
-  if (m.version == PROTO_VERSION && m.type == MSG_ACK) appAcked = true;
+  if (m.version == PROTO_VERSION && m.type == MSG_ACK) {
+    ackAlarmActive = (m.flags & ACK_ALARM_ACTIVE) != 0;   // valid to read once appAcked is set
+    appAcked = true;
+  }
 }
 
 uint16_t readBatteryMv() {
@@ -125,39 +154,41 @@ void blinkColor(int times, int onMs, int offMs, uint8_t r, uint8_t g, uint8_t b)
   }
 }
 
-// Minimal HSV->RGB (full saturation). h in degrees [0,360); v is the brightness cap.
-void hsvToRgb(uint16_t h, uint8_t v, uint8_t &r, uint8_t &g, uint8_t &b) {
-  uint8_t region = (h / 60) % 6;
-  uint8_t rem    = (h % 60) * 255 / 60;              // 0..255 position within the region
-  uint8_t up     = (uint16_t)v * rem / 255;          // ramp 0 -> v
-  uint8_t down   = v - up;                            // ramp v -> 0
-  switch (region) {
-    case 0: r = v;    g = up;   b = 0;    break;
-    case 1: r = down; g = v;    b = 0;    break;
-    case 2: r = 0;    g = v;    b = up;   break;
-    case 3: r = 0;    g = down; b = v;    break;
-    case 4: r = up;   g = 0;    b = v;    break;
-    default:r = v;    g = 0;    b = down; break;
-  }
-}
+// Blink RED and GREEN helpers — the only two feedback states (plus off).
+// RED = something is wrong (RX unreachable); GREEN = someone is coming (alert received/active).
+void blinkRed(int n = BLINK_BURST)   { blinkColor(n, BLINK_ON_MS, BLINK_OFF_MS, RGB_LEVEL, 0, 0); }
+void blinkGreen(int n = BLINK_BURST) { blinkColor(n, BLINK_ON_MS, BLINK_OFF_MS, 0, RGB_LEVEL, 0); }
 
-// One smooth rainbow sweep across the single WS2812 (hue 0->360). Blocks ~RAINBOW_SWEEP_MS,
-// leaves the pixel off. Used as the "RX not reachable" alarm on the TX itself.
-void rainbowSweep() {
-  const int steps = 120;
-  for (int i = 0; i < steps; i++) {
-    uint8_t r, g, b;
-    hsvToRgb((uint16_t)(i * 360 / steps), RAINBOW_LEVEL, r, g, b);
-    ledColor(r, g, b);
-    delay(RAINBOW_SWEEP_MS / steps);
+// Blink one RED round (~BLINK_BURST on/off cycles) while CONTINUOUSLY watching the button.
+// Returns true the instant a debounced press (>= DEBOUNCE_MS continuous LOW) is seen, so a
+// wearer who presses during an awake link-down loop still gets a real ALERT. EXT1 only wakes
+// the chip from deep sleep — while we're awake the button must be POLLED, not waited-on via
+// wake. Leaves the pixel off. (The digital driver already owns the pad via prepareButtonInput.)
+bool blinkRedWatchButton() {
+  for (int seg = 0; seg < BLINK_BURST * 2; seg++) {
+    bool on = (seg % 2 == 0);
+    ledColor(on ? RGB_LEVEL : 0, 0, 0);
+    uint32_t dur = on ? BLINK_ON_MS : BLINK_OFF_MS;
+    uint32_t start = millis(), lowSince = 0;
+    bool low = false;
+    while (millis() - start < dur) {
+      if (digitalRead(BUTTON_GPIO) == LOW) {
+        if (!low) { low = true; lowSince = millis(); }
+        else if (millis() - lowSince >= DEBOUNCE_MS) { ledOff(); return true; }
+      } else {
+        low = false;
+      }
+      delay(2);
+    }
   }
   ledOff();
+  return false;
 }
 
 // Returns true only after the RECEIVER app-level ACK is received (requirement #1).
 bool sendMessage(const Message &msg) {
   for (int attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
-    macCbFired = macDelivered = appAcked = false;
+    macCbFired = macDelivered = appAcked = ackAlarmActive = false;
     if (esp_now_send(RX_MAC, (const uint8_t *)&msg, sizeof(msg)) != ESP_OK) {
       delay(50); continue;
     }
@@ -259,66 +290,64 @@ void setup() {
     newPress = waitButtonStable(LOW, PRESS_CONFIRM_MS);
     if (!newPress) Serial.println("EXT1 wake but no debounced press (glitch) -> heartbeat");
   }
-  if (newPress) {
-    alertPending = true;
-    alertSeq     = ++seqCounter;     // one seq for this alert; reused across retries and resets
-    saveAlertState();                // PERSIST to flash NOW, before any send -- so even a
-                                     // brownout/power-loss during the first transmit can't lose it
-  }
+  if (newPress) latchAlert();        // debounced wake-press -> persisted alert (survives any reset)
 
   Message msg = {};
-  msg.version    = PROTO_VERSION;
-  msg.device_id  = DEVICE_ID;
-  msg.battery_mv = readBatteryMv();
+  msg.version   = PROTO_VERSION;
+  msg.device_id = DEVICE_ID;
 
-  if (alertPending) {
-    // Deliver (or RESUME delivering) the pending alert. Because alertPending/alertSeq
-    // live in FLASH, a reset/brownout/power-loss mid-alert lands us right back here on
-    // reboot and we keep going — the alert is never abandoned. We stay awake and retry
-    // continuously until the RX confirms the latch (battery trade-off accepted by design,
-    // see HANDOFF §alert). seq is fixed, so the idempotent RX latch tolerates duplicates.
-    msg.type = MSG_ALERT;
-    msg.seq  = alertSeq;
-    Serial.printf("ALERT seq=%lu batt=%u — sending, will retry until acked (persists across resets)\n",
-                  (unsigned long)msg.seq, msg.battery_mv);
-    uint32_t round = 0;
-    while (!sendMessage(msg)) {       // sendMessage = one burst of retries; loop = forever
-      round++;
-      Serial.printf("[tx] ALERT not yet acked (round %lu) — retrying\n", (unsigned long)round);
-      blinkColor(6, 300, 150, RGB_LEVEL, 0, 0);   // urgent RED: NOT confirmed yet -> seek help another way
-    }
-    alertPending = false;            // RX confirmed the latch -> the alert is delivered
-    saveAlertState();                // clear the persisted flag so we don't resume after reboot
-    Serial.println("[tx] ALERT CONFIRMED (ack received)");
-    blinkColor(2, 60, 80, 0, RGB_LEVEL, 0);     // confirmed: two quick GREEN blinks
+  if (alertPending)
+    Serial.printf("ALERT seq=%lu — staying awake, GREEN until the RX operator clears (persists across resets)\n",
+                  (unsigned long)alertSeq);
 
-    // Wait for a clean, debounced RELEASE so bounce can't immediately re-arm EXT1.
-    // If it never releases, goToSleep() sleeps on the timer only (won't arm a held pad).
-    waitButtonStable(HIGH, RELEASE_WAIT_MS);
-  } else {
-    // Timer heartbeat OR cold boot / reset / brownout / debounced-away glitch -> heartbeat.
-    msg.type = MSG_HEARTBEAT;
-    msg.seq  = ++seqCounter;
-    Serial.printf("HEARTBEAT seq=%lu batt=%u (wakeup_cause=%d) ... ",
-                  (unsigned long)msg.seq, msg.battery_mv, (int)cause);
-    bool ok = sendMessage(msg);
-    Serial.println(ok ? "ack" : "no ack");
+  // Unified awake loop. While an ALERT is pending we keep (re)sending it — GREEN when the RX
+  // has it latched ("someone is coming"), RED when the RX is unreachable ("something is
+  // wrong") — never sleeping until the operator CLEARS it (signalled back in the ACK). That
+  // lets the responder stop the TX draining its battery, and the FIXED, flash-persisted seq
+  // means a reset/brownout mid-alert resumes right here (req #6: a bare reset never clears it).
+  // Otherwise we send a HEARTBEAT; if the link is down we blink RED **and POLL the button**,
+  // so a press during the awake link-down loop escalates into a real, persisted ALERT (EXT1
+  // only wakes from sleep, so while awake the button must be polled — this was the dropped-
+  // press bug). Self-healing: the moment the RX returns, the next heartbeat acks and we sleep.
+  for (;;) {
+    if (alertPending) {
+      msg.type       = MSG_ALERT;
+      msg.seq        = alertSeq;
+      msg.battery_mv = readBatteryMv();          // refresh so the RX sees live battery
+      bool acked = sendMessage(msg);
+      if (!acked) {
+        Serial.printf("[tx] ALERT seq=%lu — RX UNREACHABLE (red), will keep trying\n", (unsigned long)alertSeq);
+        blinkRed();                              // RED = something is wrong: seek help another way
+      } else if (ackAlarmActive) {
+        blinkGreen();                            // GREEN = someone is coming: RX has the alarm latched
+      } else {
+        // operator cleared it -> escort the responder in with GREEN, then drop to normal cycle
+        Serial.println("[tx] RX operator CLEARED the alarm — GREEN escort blinks, then normal cycle");
+        blinkGreen(GREEN_ESCORT_BLINKS);
+        alertPending = false;
+        saveAlertState();                        // clear persisted flag so we don't resume after reboot
+        waitButtonStable(HIGH, RELEASE_WAIT_MS); // debounced release so bounce can't re-arm EXT1
+        break;
+      }
+    } else {
+      msg.type       = MSG_HEARTBEAT;
+      msg.seq        = ++seqCounter;
+      msg.battery_mv = readBatteryMv();
+      Serial.printf("HEARTBEAT seq=%lu batt=%u (wakeup_cause=%d) ... ",
+                    (unsigned long)msg.seq, msg.battery_mv, (int)cause);
+      bool ok = sendMessage(msg);
+      Serial.println(ok ? "ack" : "no ack");
+      if (ok) break;                             // link healthy -> sleep
 
-    // LINK-DOWN ALARM: a heartbeat that the RX doesn't app-ACK means the receiver is
-    // unreachable — a condition that should never happen in normal use, so the wearer must
-    // notice it immediately. Stay awake and cycle a bright rainbow, re-sending the heartbeat
-    // each round, until the RX acks. Battery cost is accepted by design (see HANDOFF §alert).
-    // An active ALERT is handled in the branch above and takes priority, so this only runs
-    // for plain heartbeats. Self-healing: the moment the RX returns, the next send acks and
-    // we drop through to normal sleep.
-    uint32_t downRound = 0;
-    while (!ok) {
-      rainbowSweep();
-      msg.seq = ++seqCounter;
-      Serial.printf("[tx] heartbeat NOT acked — RX unreachable (round %lu), rainbow + retry seq=%lu ... ",
-                    (unsigned long)++downRound, (unsigned long)msg.seq);
-      ok = sendMessage(msg);
-      Serial.println(ok ? "ack — link restored" : "no ack");
+      // LINK DOWN: RX unreachable. Blink RED while WATCHING the button; a press escalates to a
+      // real persisted ALERT (the old loop never read the button, so a press here was lost).
+      if (blinkRedWatchButton()) {
+        latchAlert();
+        Serial.printf("[tx] button pressed during link-down -> ALERT seq=%lu (persisted)\n",
+                      (unsigned long)alertSeq);
+        // loop: alertPending is now true -> handled by the ALERT branch above
+      }
+      // else keep looping as a heartbeat link-down (RED)
     }
   }
 
