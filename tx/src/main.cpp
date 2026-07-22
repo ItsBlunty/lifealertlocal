@@ -48,6 +48,12 @@ uint8_t RX_MAC[6] = {0xEC, 0xE3, 0x34, 0x1A, 0x64, 0xFC};   // receiver = WROOM 
 #define ACK_TIMEOUT_MS      400          // wait for app-level ACK per attempt
 #define MAX_SEND_ATTEMPTS   20           // persistence for an alert
 #define DEVICE_ID           1
+// Low-battery indicator (LOWEST-priority LED mode): while the cell is below LOW_BATT_MV the TX
+// blips a single BLUE flash and then deep-sleeps only LOW_BATT_SLEEP_SEC (not HEARTBEAT_SECONDS),
+// so you see ~one blue flash every 10 s. It lives only in the link-healthy/idle path, so GREEN
+// (alerting) and RED (link down/undelivered) always override it — anything but Off wins.
+#define LOW_BATT_MV         3400         // TX-local threshold; independent of the RX's own LOW_BATT_MV
+#define LOW_BATT_SLEEP_SEC  10           // fast wake cadence while low (blue blip + heartbeat), vs 300 s normal
 
 // Button debounce / anti-wedge (see the "stuck-awake heartbeat flood" note in HANDOFF).
 // Biased HARD toward CATCHING a real press (a life-alert must not drop one): DEBOUNCE_MS is
@@ -88,6 +94,7 @@ RTC_NOINIT_ATTR uint32_t seqCounter;
 Preferences prefs;
 bool     alertPending = false;   // mirror of the flash flag, loaded each boot
 uint32_t alertSeq     = 0;       // fixed seq for the pending alert (RX latch is idempotent)
+bool     lowBattery   = false;   // set on the idle/healthy path -> goToSleep() uses the fast wake cadence
 
 void loadAlertState() {
   prefs.begin("lifealert", true);            // read-only
@@ -158,6 +165,37 @@ void blinkColor(int times, int onMs, int offMs, uint8_t r, uint8_t g, uint8_t b)
 // RED = something is wrong (RX unreachable); GREEN = someone is coming (alert received/active).
 void blinkRed(int n = BLINK_BURST)   { blinkColor(n, BLINK_ON_MS, BLINK_OFF_MS, RGB_LEVEL, 0, 0); }
 void blinkGreen(int n = BLINK_BURST) { blinkColor(n, BLINK_ON_MS, BLINK_OFF_MS, 0, RGB_LEVEL, 0); }
+// BLUE = lowest-priority low-battery blip (one flash per idle wake). See LOW_BATT_MV.
+void blinkBlue(int n = 1)            { blinkColor(n, BLINK_ON_MS, BLINK_OFF_MS, 0, 0, RGB_LEVEL); }
+
+// ---- boot-only battery-VOLTAGE readout on the RGB pixel (diagnostic) ----
+// Runs ONCE on a true power-on / RESET (not on a deep-sleep wake) and NOT while an alert is
+// pending (an alert must show immediately, never wait behind a diagnostic). Sequence:
+//   * 5 PURPLE flashes                = "battery readout coming"
+//   * then 3 identical rounds of:  ORANGE x (volts ones digit), then BLUE x (tenths digit)
+//     e.g. 3.8 V -> 3 orange then 8 blue, repeated 3x  (voltage rounded to the nearest 0.1 V).
+// Flashes are ~2/s so they're countable; the whole readout takes ~15-20 s.
+// CAVEAT: a digit of 0 (e.g. exactly 4.0 V, or "N/A" when battery sense is off) shows as NO
+// flashes for that digit — 4.0 V reads as "4 orange, then nothing".
+#define READOUT_ON_MS   220
+#define READOUT_OFF_MS  200
+void showBatteryLevel() {
+  uint16_t mv     = readBatteryMv();
+  uint16_t tenths = (mv + 50) / 100;          // round to nearest 0.1 V: 3830 -> 38
+  uint8_t  ones   = tenths / 10;              // volts ones digit (3.x -> 3)
+  uint8_t  dec    = tenths % 10;              // tenths digit     (x.8 -> 8)
+  Serial.printf("[tx] boot battery readout: %u mV -> %u.%u V  (%u orange + %u blue, x3)\n",
+                mv, ones, dec, ones, dec);
+  blinkColor(5, READOUT_ON_MS, READOUT_OFF_MS, RGB_LEVEL, 0, RGB_LEVEL);   // 5 PURPLE = readout coming
+  delay(600);
+  for (int round = 0; round < 3; round++) {
+    blinkColor(ones, READOUT_ON_MS, READOUT_OFF_MS, RGB_LEVEL, RGB_LEVEL * 2 / 5, 0);  // ORANGE x ones
+    delay(500);                                                                        // gap: ones -> tenths
+    blinkColor(dec,  READOUT_ON_MS, READOUT_OFF_MS, 0, 0, RGB_LEVEL);                   // BLUE   x tenths
+    delay(900);                                                                        // gap between rounds
+  }
+  ledOff();
+}
 
 // Blink one RED round (~BLINK_BURST on/off cycles) while CONTINUOUSLY watching the button.
 // Returns true the instant a debounced press (>= DEBOUNCE_MS continuous LOW) is seen, so a
@@ -240,7 +278,9 @@ void goToSleep() {
   } else {
     Serial.println("button still LOW at sleep -> timer-only wake (will re-arm once released)");
   }
-  esp_sleep_enable_timer_wakeup((uint64_t)HEARTBEAT_SECONDS * 1000000ULL);
+  // While the battery is low, wake often (fast blue-blip cadence); otherwise the normal 5-min heartbeat.
+  uint32_t sleepSec = lowBattery ? LOW_BATT_SLEEP_SEC : HEARTBEAT_SECONDS;
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
   esp_deep_sleep_start();
 }
 
@@ -258,6 +298,11 @@ void setup() {
   loadAlertState();   // pull the undelivered-alert flag from flash (survives any reset)
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+  // Boot-only battery-voltage readout: only on a true RESET / power-on (UNDEFINED wake cause,
+  // i.e. NOT a deep-sleep timer/EXT1 wake), and skipped while an alert is pending so a reset
+  // mid-alert resumes the alert immediately instead of waiting behind the ~15-20 s diagnostic.
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED && !alertPending) showBatteryLevel();
 
   WiFi.mode(WIFI_STA);
 
@@ -337,7 +382,16 @@ void setup() {
                     (unsigned long)msg.seq, msg.battery_mv, (int)cause);
       bool ok = sendMessage(msg);
       Serial.println(ok ? "ack" : "no ack");
-      if (ok) break;                             // link healthy -> sleep
+      if (ok) {
+        // Link healthy, no alert -> the ONLY place the low-priority blue blip runs (0 mV = N/A).
+        lowBattery = (msg.battery_mv != 0 && msg.battery_mv < LOW_BATT_MV);
+        if (lowBattery) {
+          Serial.printf("[tx] battery LOW (%u mV < %u) -> blue blip, wake every %ds\n",
+                        msg.battery_mv, LOW_BATT_MV, LOW_BATT_SLEEP_SEC);
+          blinkBlue();
+        }
+        break;                                   // sleep (fast cadence if low, else 300 s)
+      }
 
       // LINK DOWN: RX unreachable. Blink RED while WATCHING the button; a press escalates to a
       // real persisted ALERT (the old loop never read the button, so a press here was lost).

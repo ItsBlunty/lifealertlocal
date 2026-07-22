@@ -19,11 +19,42 @@ ESP-NOW link between a button (**TX**, deep-sleeping) and a **latching alarm** a
   done (2026-07-07): flashed, MAC paired into `rx/`, heartbeat link confirmed live.**
 
 Status: **firmware written, both images build, RX + XIAO-S3-TX pairing verified on
-hardware** (heartbeats received, `seq` increments across deep-sleep cycles). No
-peripherals (buzzer/external LEDs/battery divider) wired yet — verification is via
-serial + an addressable RGB LED (see below). **Both boards reflashed 2026-07-10 with the
-D9 button + WS2812 + 300 s heartbeat build; physical button ALERT on D9, the D1 RGB LED,
-and the rainbow link-down indicator all confirmed working on hardware (see §6/§8).**
+hardware** (heartbeats received, `seq` increments across deep-sleep cycles). Battery divider
+wired + calibrated on the TX; buzzer still not wired. Both boards now drive an addressable
+WS2812 for visible state: the **TX** pixel on D1/GPIO2 (green/red feedback + blue low-batt +
+boot voltage readout), and a **new RX** pixel on GPIO4 (rainbow strobe on alarm, R-R/G-G/B-B
+on offline). **Latest verified build 2026-07-22 (see the 2026-07-22 section below); TX cell ≈ 3.9 V.**
+
+### 2026-07-22 changes (RX external rainbow/offline LED + faster offline + TX low-batt blue blip + TX boot battery readout)
+Both images build clean. Board states: **RX flashed** (COM3) with all the RX items below; **TX flashed
+production** (COM12 in bootloader) with both TX items below. Current TX cell ≈ **3.9 V** (read via the new
+boot readout LED — above the 3.4 V low-batt threshold, so no blue blip in normal use right now).
+
+- **RX external WS2812 NeoPixel on GPIO4 — ✅ BOTH MODES VERIFIED ON HARDWARE.** A second addressable
+  pixel (same `neopixelWrite()` idiom as the TX; DIN→GPIO4, VDD→3V3, GND→GND) gives loud visible alarm
+  state on the always-awake RX:
+  - **ALARM latched → bright RAINBOW STROBE** (~8 Hz, hue sweep ≈1.5 s). `hsvWheel()` + a cached
+    `setPixel()` (only writes on color change, so the RMT isn't bit-banged every fast loop).
+  - **OFFLINE → Red-Red / Green-Green / Blue-Blue, repeating** (6 half-on/off slots @ `OFFLINE_SLOT_MS`
+    220 ms) so you can tell *at the RX* the TX has gone missing. `PIXEL_LEVEL` 255 (mains-powered, no
+    drain worry). Idle/low-batt → dark. Onboard STATUS LED (GPIO2) still mirrors state as a redundant cue.
+- **RX offline threshold cut 900 s → 610 s.** Replaced `OFFLINE_MULT` with a direct `OFFLINE_SECONDS 610`
+  = two 300 s heartbeats + 10 s margin (15 min was too long). `offline = (now-lastHb) > OFFLINE_SECONDS*1000`.
+- **TX low-battery BLUE blip (LOWEST-priority LED mode) — ⚠️ built + flashed, NOT hardware-verified**
+  (cell is 3.9 V > 3.4 V, so it can't trigger without a fake-low build or a real sag). When batt < `LOW_BATT_MV`
+  3400: one **blue** flash on the idle/link-healthy path, then deep-sleep only `LOW_BATT_SLEEP_SEC` 10 s
+  (vs 300 s) → ~one blue blip every 10 s, chip asleep in between, heartbeating each wake. It lives ONLY in
+  the link-healthy+no-alert branch, so GREEN (alerting) and RED (link down/undelivered) always override it
+  (spec: "anything but Off wins"). Self-healing: ≥3.4 V → no blue, back to 300 s. To test: `FAKE_BATTERY_MV
+  3200` + `BATTERY_SENSE_ENABLED 0`, reflash, expect blue every ~10 s (and the RX low-batt path too).
+- **TX boot-only battery-VOLTAGE readout on the pixel — ✅ VERIFIED (user read 3.9 V off the LED).** Runs
+  ONCE on a true RESET/power-on (`ESP_SLEEP_WAKEUP_UNDEFINED`, not a timer/EXT1 wake) and is skipped while
+  an alert is pending (alert shows immediately, never waits behind the diagnostic). Sequence: **5 PURPLE**
+  ("readout coming"), then **3 rounds** of **ORANGE × volts-ones-digit** then **BLUE × tenths-digit**
+  (voltage rounded to 0.1 V; e.g. 3.9 V = 3 orange + 9 blue, ×3). ~15-20 s total; delays the first
+  post-reset heartbeat by that long (harmless). **Caveat: a digit of 0 (exactly x.0 V, or N/A when sense
+  is off) shows as NO flashes for that digit.**
+- **Uncommitted:** all four items above are in the working tree, not yet committed.
 
 ### 2026-07-17 changes (LED→two states + "clear-to-stand-down" protocol + link-down dropped-press FIX) — ✅ TX reflashed 2026-07-22; **link-down dropped-press FIX + 10 ms debounce VERIFIED ON HARDWARE**
 - **TX LED reduced to TWO states + off** (was green-2-blink / red-6-blink / rainbow):
@@ -363,11 +394,15 @@ is only used for entering the flash bootloader. (RX clear button can still be an
 
 ## 8. Next steps / roadmap
 
-1. Test low-battery (#5) via `FAKE_BATTERY_MV 3200`.
+1. **Verify the low-battery paths on hardware** (still pending): the RX `LOW-BATTERY` state AND the
+   new **TX blue blip / 10 s fast-wake** (2026-07-22). Test via `FAKE_BATTERY_MV 3200` +
+   `BATTERY_SENSE_ENABLED 0` on the TX, or let a real cell sag below 3.4 V.
 2. Wire peripherals: active buzzer (GPIO25), alarm LED (GPIO26), optional TX
    vibration motor (via transistor); verify the 3 warning states are audibly distinct.
-3. Battery divider on ADC1 (GPIO34): set `BATTERY_SENSE_ENABLED 1`,
-   `BATTERY_DIVIDER = (R1+R2)/R2`, calibrate vs multimeter, set `LOW_BATT_MV`.
+   (RX external WS2812 rainbow/offline pixel on GPIO4 is **done + verified 2026-07-22**.)
+3. ~~Battery divider on ADC1: set `BATTERY_SENSE_ENABLED 1`, calibrate, set `LOW_BATT_MV`.~~
+   **DONE 2026-07-12** (divider on D2/GPIO3, `BATTERY_DIVIDER` 2.0306). Consider tuning the RX
+   `LOW_BATT_MV` (3300) to align with the TX blue-blip threshold (3400) if you want them to match.
 4. ~~Raise `HEARTBEAT_SECONDS` to 300 in **both** projects.~~ **DONE 2026-07-07** (offline now ~15 min).
 5. Permanent build: ~~dedicated trigger GPIO (off BOOT)~~ **done on XIAO (D9/GPIO8)**;
    enclosure, RX power backup (mains-only today = alarm dead on power loss), optional

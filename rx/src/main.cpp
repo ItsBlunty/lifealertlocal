@@ -4,10 +4,11 @@
 // persistent alarm until a human clears it at the receiver). Tracks liveness
 // and battery from heartbeats and drives three distinguishable warnings plus idle.
 //
-// NO PERIPHERALS WIRED YET: buzzer (GPIO25) and alarm LED (GPIO26) are kept for
-// the real build, but right now verification is via the SERIAL LOG (every state
-// transition is printed) and the onboard STATUS LED (GPIO2), which mirrors the
-// current state so you get visible feedback on a bare dev board.
+// Buzzer (GPIO25) and the plain alarm LED (GPIO26) are scaffolding kept for the real
+// build. Visible feedback today: the SERIAL LOG (every state transition is printed), the
+// onboard STATUS LED (GPIO2) which mirrors state, and an external WS2812 NeoPixel on
+// GPIO4: a BRIGHT RAINBOW STROBE while the alarm is latched, and an R-R/G-G/B-B blink
+// sequence while OFFLINE (TX not seen), off otherwise.
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -20,10 +21,15 @@ uint8_t TX_MAC[6] = {0xE0, 0x72, 0xA1, 0xF9, 0x54, 0x1C};   // transmitter (boar
 #define BUZZER_GPIO        25         // active buzzer (digitalWrite). Wire later.
 #define ALARM_LED_GPIO     26         // alarm LED. Wire later.
 #define STATUS_LED_GPIO    2          // onboard LED — also the no-buzzer test indicator
+#define RAINBOW_LED_GPIO   4          // external WS2812 NeoPixel DATA-IN — bright rainbow strobe on ALARM
 #define CLEAR_BUTTON_GPIO  0          // BOOT button clears the alarm (prototype)
-#define HEARTBEAT_SECONDS  300        // deployment value (5 min). MUST match TX. Offline = this * OFFLINE_MULT.
-#define OFFLINE_MULT       3          // offline after this many missed heartbeats
+#define HEARTBEAT_SECONDS  300        // deployment value (5 min). MUST match TX.
+#define OFFLINE_SECONDS    610        // declare TX offline after this much silence: 2 heartbeats (600s) + 10s margin
 #define LOW_BATT_MV        3300       // tune to battery chemistry (with margin above cutoff)
+#define RAINBOW_STROBE_MS  120        // strobe period (ms): ON for the first half, OFF for the second (~8 Hz)
+#define RAINBOW_HUE_STEP_MS 6         // ms per hue step; full 256-step rainbow sweep ≈ 1.5 s
+#define OFFLINE_SLOT_MS    220        // per-blink slot for the OFFLINE R-R/G-G/B-B pattern (half on, half off)
+#define PIXEL_LEVEL        255        // brightness for the OFFLINE primary colors
 // ----------------------------------------
 
 volatile bool     alarmLatched   = false;
@@ -99,6 +105,33 @@ const char *stateName(RxState s) {
 
 void buzz(bool on) { digitalWrite(BUZZER_GPIO, on ? HIGH : LOW); }
 
+// ---- external WS2812 rainbow strobe (same neopixelWrite() idiom as the TX) ----
+// Full-saturation, full-brightness HSV wheel: h 0..255 -> a pure spectral RGB.
+void hsvWheel(uint8_t h, uint8_t &r, uint8_t &g, uint8_t &b) {
+  uint8_t region = h / 43;             // 0..5 sextants
+  uint8_t f      = (h - region * 43) * 6;  // ramp within the sextant, ~0..255
+  uint8_t q      = 255 - f;
+  switch (region) {
+    case 0:  r = 255; g = f;   b = 0;   break;
+    case 1:  r = q;   g = 255; b = 0;   break;
+    case 2:  r = 0;   g = 255; b = f;   break;
+    case 3:  r = 0;   g = q;   b = 255; break;
+    case 4:  r = f;   g = 0;   b = 255; break;
+    default: r = 255; g = 0;   b = q;   break;
+  }
+}
+
+// Write the pixel only when the color actually changes — neopixelWrite() bit-bangs the RMT
+// (~hundreds of µs incl. the reset latch), so we must not call it every fast loop iteration.
+void setPixel(uint8_t r, uint8_t g, uint8_t b) {
+  static uint8_t lr = 1, lg = 1, lb = 1;   // impossible init value -> first call always writes
+  static bool    init = false;
+  if (!init || r != lr || g != lg || b != lb) {
+    neopixelWrite(RAINBOW_LED_GPIO, r, g, b);
+    lr = r; lg = g; lb = b; init = true;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(50);
@@ -140,8 +173,7 @@ void loop() {
     }
   }
 
-  bool offline = (now - lastHeartbeatMs) >
-                 (uint32_t)HEARTBEAT_SECONDS * OFFLINE_MULT * 1000UL;
+  bool offline = (now - lastHeartbeatMs) > (uint32_t)OFFLINE_SECONDS * 1000UL;
 
   RxState state = alarmLatched ? ST_ALARM
                 : offline      ? ST_OFFLINE
@@ -182,5 +214,32 @@ void loop() {
       buzz(false);
       digitalWrite(STATUS_LED_GPIO, (now % 3000) < 40);
       break;
+  }
+
+  // External WS2812 indicator (onboard STATUS_LED still mirrors state as a redundant cue):
+  //   ALARM   -> bright rainbow strobe
+  //   OFFLINE -> R-R / G-G / B-B blink sequence, repeating (TX not seen -> we know locally)
+  //   else    -> dark
+  if (state == ST_ALARM) {
+    if ((now % RAINBOW_STROBE_MS) < RAINBOW_STROBE_MS / 2) {
+      uint8_t r, g, b;
+      hsvWheel((now / RAINBOW_HUE_STEP_MS) & 0xFF, r, g, b);
+      setPixel(r, g, b);
+    } else {
+      setPixel(0, 0, 0);
+    }
+  } else if (state == ST_OFFLINE) {
+    // 6 slots: red, red, green, green, blue, blue -> repeat. Each slot is half-on, half-off.
+    static const uint8_t seq[6][3] = {
+      {PIXEL_LEVEL, 0, 0}, {PIXEL_LEVEL, 0, 0},
+      {0, PIXEL_LEVEL, 0}, {0, PIXEL_LEVEL, 0},
+      {0, 0, PIXEL_LEVEL}, {0, 0, PIXEL_LEVEL},
+    };
+    uint32_t slot = (now / OFFLINE_SLOT_MS) % 6;
+    bool on = (now % OFFLINE_SLOT_MS) < OFFLINE_SLOT_MS / 2;
+    if (on) setPixel(seq[slot][0], seq[slot][1], seq[slot][2]);
+    else    setPixel(0, 0, 0);
+  } else {
+    setPixel(0, 0, 0);
   }
 }
